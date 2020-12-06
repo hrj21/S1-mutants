@@ -1,0 +1,282 @@
+---
+title: "Comparison of S1 protein conditions"
+author: "Hefin Rhys"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dev = "svg")
+```
+
+## Purpose
+
+This is an R Markdown document detailing my analysis of the ELISA data. The purpose of the experiment is to determine whether different reactivity is observed between five different SARS-Cov2 S1 spike protein conditions. 90 samples (with varying degrees of reactivity) were each tested across the five conditions, and the data therefore represent repeated measurements made on each sample.
+
+## Loading packages
+
+I start by loading the required R packages for the analysis.
+
+```{r load_packages}
+library(tidyverse)                            # data wrangling and plotting
+library(rethinking)                           # Bayesian modeling
+library(tidybayes)                            # tools for tidying model draws
+library(tidybayes.rethinking)                 # tools for tidying model draws
+library(modelr)                               # for data_grid() function
+library(patchwork)                            # for combining plots together
+```
+
+## Reading data
+
+Next, I read in the data that is in tidy format as a .csv file, and store it as the object `elisa`.
+
+```{r read_data}
+elisa <- read_csv("../data/ELISA_data.csv")
+```
+
+I inspect its structure by printing the first 10 rows of data. There are four columns:
+a character vector `Protein` that indicates the experimental condition, a double precision numeric vector `OD` that indicates the optical density of the reading (the dependent variable), a double precision numeric vector `SCO` that will not be used in this analysis, and a character vector `Sample`, which indicates which sample the reading was taken from. 
+
+```{r elisa}
+elisa
+```
+
+## Plotting the empirical data
+
+I next plot the data to visualize the relationships between the `Protein`, `Sample`, and `OD` variables. So that the levels of the `Protein` variable are plotted in order, I first convert this variable into a factor and specify the order of its levels.
+
+```{r convert_to_factor}
+elisa$Protein <- factor(
+  elisa$Protein, 
+  levels = c("S1", "AT-S1", "AT-S1+BLV", "MUTANT", "MUTANT+BLV")
+  )
+```
+
+Now that `Protein` is a factor, its levels will be plotted in the desired order. There are a few observations to make about this data:
+
+- the dependent variable is strictly positive and is clearly bounded at zero, but does not have an obvious upper bound
+- the marginal distribution of the dependent variable is clearly not normally-distributed, but is considerably positively skewed
+- OD values between conditions are highly correlated within samples, and ignoring the repeated observations will likely lead to underestimated parameter values.
+
+```{r}
+ggplot(elisa, aes(x = Protein, y = OD, group = Sample)) +
+  geom_line(alpha = 0.3) +
+  geom_point(alpha = 0.3) +
+  theme_bw()
+```
+
+## Modeling the data
+
+To model the relationships in the data, I start by numerically-encoding the categorical variables, and removing the `SCO` variable. This is just how the `ulam()` function I use to fit the models, expects categorical variables.
+
+```{r numeric_encoding}
+model_data <- elisa %>%
+  mutate(Protein = as.integer(Protein),
+         Sample = as.integer(as.factor(Sample))) %>% 
+  select(-SCO)
+```
+
+The `OD` dependent variable does not appear to be normally-distributed within each experimental condition, but has most of its mass between 0 and 0.5 with long tails and does not have any 0 values. Rather than try to transform the `OD` variable to force it to approximate a normal distribution, it's better (and simple enough) to use a different conditional probability density function to model the distribution of values. The gamma distribution is a good candidate as it is flexible enough to represent the long tail, high mass at low values of the `OD` data. 
+
+The figures below shows various examples of gamma distributions (using the mu, scale parameterization of the `rethinking::dgamma2()` function). The first figure shows the impact of changing the scale parameter when mu is fixed. As the scale is increased, greater probability density is placed near zero. The second figure shows the impact of changing the mu parameter when scale is fixed. As mu is increased, the center of the probability density is pushed further away from zero.
+
+```{r gamma_examples, echo=FALSE}
+gamma_x <- seq(0, 5, 0.01)
+gamma_mu <- 1.2
+gamma_scale <- seq(0.5, 1, 0.1)
+
+gamma_data <- expand.grid(gamma_x, gamma_mu, gamma_scale) %>%
+  rename(x = Var1, mu = Var2, scale = Var3) %>%
+  mutate(y = dgamma2(x, mu, scale))
+
+ggplot(gamma_data, aes(x, y, group = as.factor(scale), col = scale)) +
+  geom_line() +
+  ggtitle("mu = 1.2 (varying scale)") +
+  theme_bw() + 
+  theme(legend.position = c(0.9, 0.75),
+        panel.grid = element_blank())
+```
+
+```{r gamma_examples_2, echo=FALSE}
+gamma_x <- seq(0, 5, 0.01)
+gamma_mu <- seq(1, 2, 0.2)
+gamma_scale <- 0.5
+
+gamma_data <- expand.grid(gamma_x, gamma_mu, gamma_scale) %>%
+  rename(x = Var1, mu = Var2, scale = Var3) %>%
+  mutate(y = dgamma2(x, mu, scale))
+
+ggplot(gamma_data, aes(x, y, group = as.factor(mu), col = mu)) +
+  geom_line() +
+  ggtitle("scale = 0.5 (varying mu)") +
+  theme_bw() + 
+  theme(legend.position = c(0.9, 0.75),
+        panel.grid = element_blank())
+```
+
+I will, therefore, model the data using the gamma likelihood function as shown below, with the mu and scale parameters being estimated from the data by the model.
+
+$$\textrm{OD} \sim \textrm{Gamma}(\mu, \textrm{scale})$$
+The linear model I use takes the form shown below. I use a log link so that the mu parameter of the gamma probability density function is the exponent of the linear model's expected value. The $\textrm{intercept}[\textrm{Sample}]$ term allows a separate intercept for each sample. This term is important as it controls for the fact that repeated measurements were made on each sample (one per condition), and that different samples have different baselines of reactivity (this is sometimes called a "random factor"). The $\textrm{offset}[\textrm{Protein}]$ term allows a different effect for each experimental condition, and represents a mean offset from each sample's intercept.
+
+$$\textrm{log(}\mu) = \textrm{intercept}[\textrm{Sample}] + \textrm{offset}[\textrm{Protein}]$$
+As this is a Bayesian model, we can incorporate prior beliefs about the parameter values, which also regularizes them. The prior probability distribution I used for each of the parameter values are detailed below.
+
+$$\textrm{offset}[\textrm{Protein}] \sim  \textrm{Normal}(-3, 0.2),$$
+$$\textrm{scale} \sim \textrm{Exponential}(5),$$
+As the $\textrm{intercept}[\textrm{Sample}]$ term is a random factor, I use partial pooling to estimate the mu and scale parameters of a gamma distribution that is assumed to represent the population these samples have been drawn from. The hyperpriors for the $\mu_\textrm{intercept}$ and $\textrm{scale}_\textrm{intercept}$ are also shown below.
+
+$$\textrm{intercept}[\textrm{Sample}] \sim \textrm{Gamma}(\mu_\textrm{intercept}, \textrm{scale}_\textrm{intercept}),$$
+$$\mu_\textrm{intercept} \sim \textrm{Normal}(1, 0.2),$$
+$$\textrm{scale}_\textrm{intercept} \sim \textrm{Exponential}(5)$$
+The model described above is fit using the code below using the `rethinking::ulam()` function. The model is stored in an object called `model_2` because I compared a handful of different parameterizations and found this to fit the data best.
+
+```{r ulam_function, echo=TRUE, results='hide'}
+model_2 <- ulam(
+  alist(
+    # likelihood function
+    OD ~ dgamma2(mu, scale),
+    # linear model
+    log(mu) <- a[Sample] + b[Protein],
+    # priors
+    b[Protein] ~ normal(-3, 0.2),
+    scale ~ exponential(5),
+    a[Sample] ~ dgamma2(mu_sample, tau_sample),
+    # hyperpriors
+    mu_sample ~ normal(1, 0.2),
+    tau_sample ~ exponential(5)
+  ), 
+  data = model_data, 
+  chains = 4, 
+  cores = 4, 
+  iter = 10000,
+  log_lik = FALSE
+)
+```
+
+## Visualizing the model
+
+To visualize the model, I plot the conditional posterior probability density of the parameter space, sampled during model training. The resulting plot represents the beliefs of the model after updating the prior probability using the empirical data, and incorporates the parameter uncertainty. The shading in the plot represents the posterior probability density, and this faithfully represents the raw data. The solid black line connects the median _a posteriori_ OD values for each experimental condition.
+
+```{r visualizing_model}
+model_data %>%
+  add_fitted_draws(model_2) %>%
+  mutate(OD = .value,
+         Protein = fct_recode(as.factor(Protein),
+                              "S1" = "1", "AT-S1" = "2", "AT-S1+BLV" = "3", 
+                              "MUTANT" = "4", "MUTANT+BLV" = "5")) %>%
+  ggplot(aes(x = Protein, y = OD)) +
+  stat_lineribbon(aes(y = .value), .width = seq(0.2, 0.9, 0.1)) +
+  geom_point(stat = "summary", fun = "median", col = "red", aes(group = Protein)) +
+  scale_fill_brewer(palette = "Blues") +
+  theme_bw() 
+```
+
+## Pairwise contrasts
+
+To answer the question of whether there are differences in binding capacity of the 5 experimental conditions, I extract the offset values sampled for each condition for each sample of the posterior probability space. By calculating the pairwise differences of the offset values for every draw from the posterior, we get a probability distribution indicating the plausibility of a range of magnitudes of differences between the conditions.  The figure below plots the posterior distribution of these ranges of plausible differences, between each pair of conditions. The histograms indicate the sample densities, the black dot indicates the maximum _a posteriori_ (most probable) difference, and the thick and thin lines indicate the 85% and 95% highest density intervals, respectively.
+
+
+```{r pairwise_contrasts}
+pairwise <- model_2 %>%
+  recover_types(elisa) %>%
+  spread_draws(b[Protein]) %>%
+  compare_levels(b, by = Protein)
+
+pairwise_summary <- median_hdi(pairwise)
+
+pairwise %>%
+  ungroup() %>%
+  mutate(Protein = reorder(Protein, b)) %>%
+  ggplot(aes(y = Protein, x = b)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  stat_halfeye(.width = c(0.95, 0.85), fill = "skyblue", point_interval = median_hdi) + 
+  scale_fill_manual(values = "skyblue") +
+  labs(y = "", x = "Difference in fitted value") +
+  theme_bw() +
+  theme()
+``` 
+
+The same data is represented below in tabular form. There are some important inferences to make from this result. For any given sample, after controlling for its intercept, the reactivity to:
+
+- AT-S1+BLV is predicted to be `r abs(round(pairwise_summary[2, ]$b, 3))` OD units lower than to AT-S1 [`r abs(round(pairwise_summary[2, ]$.upper, 3))`, `r abs(round(pairwise_summary[2, ]$.lower, 3))`]
+- MUTANT is predicted to be `r abs(round(pairwise_summary[4, ]$b, 3))` OD units lower than to AT-S1 [`r abs(round(pairwise_summary[4, ]$.upper, 3))`, `r abs(round(pairwise_summary[4, ]$.lower, 3))`]
+- MUTANT+BLV is predicted to be `r abs(round(pairwise_summary[7, ]$b, 3))` OD units lower than to AT-S1 [`r abs(round(pairwise_summary[7, ]$.upper, 3))`, `r abs(round(pairwise_summary[7, ]$.lower, 3))`]
+- AT-S1 is predicted to be `r abs(round(pairwise_summary[1, ]$b, 3))` OD units higher than to S1 [`r abs(round(pairwise_summary[1, ]$.lower, 3))`, `r abs(round(pairwise_summary[1, ]$.upper, 3))`]
+- MUTANT+BLV is predicted to be `r abs(round(pairwise_summary[8, ]$b, 3))` OD units higher than to AT-S1+BLV [`r abs(round(pairwise_summary[8, ]$.lower, 3))`, `r abs(round(pairwise_summary[8, ]$.upper, 3))`]
+
+All other pairwise differences have a zero difference within their 95% highest density interval, indicating weak or no evidence to suggest a systematic difference in reactivity between these coatings. Of particular interest: there is no evidence to suggest a difference between the MUTANT and AT-S1+BLV conditions.
+
+
+```{r table_pairwise}
+knitr::kable(
+  model_2 %>%
+    recover_types(elisa) %>%
+    spread_draws(b[Protein]) %>%
+    compare_levels(b, by = Protein) %>%
+    median_hdi()
+)
+```
+
+## Chain diagnostics
+
+Below is some diagnostic information about the Hamiltonian Monte Carlo search used to find the posterior.
+
+```{r parameter_diagnostics}
+precis(model_2, depth = 2)
+```
+
+```{r traceplot}
+traceplot(model_2, window = c(5000, 10000))
+```
+
+## Figure for paper
+
+```{r paper_figure}
+plot_a <- elisa %>%
+  filter(Protein == "AT-S1" | Protein == "AT-S1+BLV" | 
+         Protein == "MUTANT"|  Protein == "MUTANT+BLV") %>%
+  pivot_wider(names_from = Protein, values_from = OD, id_cols = Sample) %>%
+  pivot_longer(names_to = "WT",
+               values_to = "OD-BLV",
+               cols = c(`AT-S1`, `MUTANT`)) %>%
+  pivot_longer(names_to = "N121Q",
+               values_to = "OD+BLV",
+               cols = c(`AT-S1+BLV`, `MUTANT+BLV`)) %>%
+  filter((WT == "AT-S1" & N121Q == "AT-S1+BLV") |
+           (WT == "MUTANT" & N121Q == "MUTANT+BLV")) %>%
+  ggplot(aes(`OD-BLV`, `OD+BLV`, col = WT)) +
+  geom_point() +
+  labs(x = "OD, -biliverdin", y = "OD, +biliverdin") +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(intercept = 0, slope = 1, col = "grey") +
+  annotate(geom = "text", label = "WT", x = 2.8, y = 2.2, size = 5, col = "#E41A1C") +
+  annotate(geom = "text", label = "N121Q", x = 2.2, y = 2.8, size = 5, col = "#377EB8") +
+  scale_color_brewer(type = "qual", palette = "Set1") +
+  theme_bw() +
+  theme(legend.position = "none")
+  
+plot_b <- model_2 %>%
+  recover_types(elisa) %>%
+  spread_draws(b[Protein]) %>%
+  compare_levels(b, by = Protein) %>%
+  ungroup() %>%
+  filter(Protein == "AT-S1+BLV - AT-S1" | Protein == "MUTANT+BLV - MUTANT") %>%
+  ggplot(aes(y = 1, x = b, fill = Protein)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  stat_halfeye(.width = c(0.85, 0.95), point_interval = "median_hdi") + 
+  annotate(geom = "text", label = "WT", x = -0.114, y = 2.2, size = 3) +
+  annotate(geom = "text", label = "N121Q", x = 0.021, y = 2.2, size = 3) +
+  scale_fill_manual(values = c("#E41A1C", "#377EB8")) +
+  scale_y_discrete(labels = c("WT", "N121Q")) +
+  labs(y = "", x = "\u0394OD (+/- biliverdin)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.background = element_blank(),
+        panel.grid.major.y = element_blank())
+
+plot_a + inset_element(plot_b, left = -0.02, bottom = 0.6, right = 0.5, top = 0.99)
+```
+

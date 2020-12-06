@@ -1,0 +1,239 @@
+---
+title: "Comparison of S1 protein conditions (cytometry)"
+author: "Hefin Rhys"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dev = "svg")
+```
+
+## Purpose
+
+This is an R Markdown document detailing my analysis of the flow cytometry data. The purpose of the experiment is to determine whether different reactivity is observed between four different SARS-Cov2 S1 spike protein conditions. 17 samples (with varying degrees of reactivity) were each tested across the four conditions, and the data therefore represent repeated measurements made on each sample.
+
+## Loading packages
+
+I start by loading the required R packages for the analysis.
+
+```{r load_packages}
+library(tidyverse)                            # data wrangling and plotting
+library(rethinking)                           # Bayesian modeling
+library(tidybayes)                            # tools for tidying model draws
+library(tidybayes.rethinking)                 # tools for tidying model draws
+library(modelr)                               # for data_grid() function
+library(patchwork)                            # for combining plots together
+```
+
+## Reading data
+
+Next, I read in the data that is in tidy format as a .csv file, and store it as the object `elisa`.
+
+```{r read_data}
+flow <- read_csv("../data/Cytometry_data.csv")
+```
+
+I inspect its structure by printing the first 10 rows of data. There are three columns:
+a character vector `Protein` that indicates the experimental condition, a double precision numeric vector `MFI` that indicates the fluorescence intensity (the dependent variable), and a character vector `Sample`, which indicates which sample (and well position) the reading was taken from. 
+
+```{r flow}
+flow
+```
+
+## Plotting the empirical data
+
+I next plot the data to visualize the relationships between the `Protein`, `Sample`, and `MFI` variables. So that the levels of the `Protein` variable are plotted in order, I first convert this variable into a factor and specify the order of its levels.
+
+```{r convert_to_factor}
+flow$Protein <- factor(
+  flow$Protein, 
+  levels = c("WT", "WT+BLV", "MUTANT", "MUTANT+BLV")
+)
+```
+
+As the `Sample` column also has the well position, I extract just the sample identifiers (without well position).
+
+```{r identifiers}
+flow$Sample <- purrr::map_chr(flow$Sample, ~{
+  str_split(., "BV ") %>% `[[`(1) %>% `[`(2)
+})
+```
+
+Now that `Protein` is a factor, its levels will be plotted in the desired order. There are a few observations to make about this data:
+
+- there are too few cases to conclude that the marginal distribution of the dependent variable is normally-distributed, but as summarized flow cytometry data are usually normally-distributed (as per the central limit theorem), we make this assumption here
+- OD values between conditions are highly correlated within samples, and ignoring the repeated observations will likely lead to underestimated parameter values.
+
+```{r}
+ggplot(flow, aes(x = Protein, y = MFI, group = Sample)) +
+  geom_line(alpha = 0.3) +
+  geom_point(alpha = 0.3) +
+  theme_bw()
+```
+
+## Modeling the data
+
+To model the relationships in the data, I start by numerically-encoding the categorical variables. This is just how the `ulam()` function I use to fit the models, expects categorical variables.
+
+```{r numeric_encoding}
+model_data <- flow %>%
+  mutate(Protein = as.integer(Protein),
+         Sample = as.integer(as.factor(Sample))) 
+```
+
+I model the data using the normal likelihood function as shown below, with the mu and sigma parameters being estimated from the data by the model.
+
+$$\textrm{MFI} \sim \textrm{Normal}(\mu, \sigma)$$
+The linear model I use takes the form shown below. The $\textrm{intercept}[\textrm{Sample}]$ term allows a separate intercept for each sample. This term is important as it controls for the fact that repeated measurements were made on each sample (one per condition), and that different samples have different baselines of reactivity (this is sometimes called a "random factor"). The $\textrm{offset}[\textrm{Protein}]$ term allows a different effect for each experimental condition, and represents a mean offset from each sample's intercept.
+
+$$\mu = \textrm{intercept}[\textrm{Sample}] + \textrm{offset}[\textrm{Protein}]$$
+As this is a Bayesian model, we can incorporate prior beliefs about the parameter values, which also regularizes them. The prior probability distribution I used for each of the parameter values are detailed below.
+
+$$\textrm{offset}[\textrm{Protein}] \sim  \textrm{Normal}(0, 400),$$
+$$\textrm{scale} \sim \textrm{Exponential}(0.1),$$
+As the $\textrm{intercept}[\textrm{Sample}]$ term is a random factor, I use partial pooling to estimate the mu and sigma parameters of a gamma distribution that is assumed to represent the population these samples have been drawn from. The hyperpriors for the $\mu_\textrm{intercept}$ and $\sigma_\textrm{intercept}$ are also shown below.
+
+$$\textrm{intercept}[\textrm{Sample}] \sim \textrm{Normal}(\mu_\textrm{intercept}, \sigma_\textrm{intercept}),$$
+$$\mu_\textrm{intercept} \sim \textrm{Normal}(2500, 200),$$
+$$\sigma_\textrm{intercept} \sim \textrm{Exponential}(0.01)$$
+The model described above is fit using the code below using the `rethinking::ulam()` function. The model is stored in an object called `model_2` because I compared a handful of different parameterizations and found this to fit the data best.
+
+```{r ulam_function, echo=TRUE, results='hide'}
+model_2 <- ulam(
+  alist(
+    # likelihood function
+    MFI ~ normal(mu, sigma),
+    # linear model
+    mu <- a[Sample] + b[Protein],
+    # priors
+    b[Protein] ~ normal(0, 400),
+    sigma ~ exponential(0.1),
+    a[Sample] ~ normal(mu_sample, tau_sample),
+    # hyperpriors
+    mu_sample ~ normal(2500, 200),
+    tau_sample ~ exponential(0.01)
+  ), 
+  data = model_data, 
+  chains = 4, 
+  cores = 4, 
+  iter = 10000,
+  log_lik = FALSE
+)
+```
+
+## Visualizing the model
+
+To visualize the model, I plot the conditional posterior probability density of the parameter space, sampled during model training. The resulting plot represents the beliefs of the model after updating the prior probability using the empirical data, and incorporates the parameter uncertainty. The shading in the plot represents the posterior probability density, and this faithfully represents the raw data. The solid black line connects the median _a posteriori_ MFI values for each experimental condition.
+
+```{r visualizing_model}
+model_data %>%
+  add_fitted_draws(model_2) %>%
+  mutate(MFI = .value,
+         Protein = fct_recode(as.factor(Protein),
+                              "WT" = "1", "WT+BLV" = "2", 
+                              "MUTANT" = "3", "MUTANT+BLV" = "4")) %>%
+  ggplot(aes(x = Protein, y = MFI)) +
+  stat_lineribbon(aes(y = .value), .width = seq(0.2, 0.9, 0.1)) +
+  geom_point(stat = "summary", fun = "median", col = "red", aes(group = Protein)) +
+  scale_fill_brewer(palette = "Blues") +
+  theme_bw() 
+```
+
+## Pairwise contrasts
+
+To answer the question of whether there are differences in binding capacity of the 4 experimental conditions, I extract the offset values sampled for each condition for each sample of the posterior probability space. By calculating the pairwise differences of the offset values for every draw from the posterior, we get a probability distribution indicating the plausibility of a range of magnitudes of differences between the conditions.  The figure below plots the posterior distribution of these ranges of plausible differences, between each pair of conditions. The histograms indicate the sample densities, the black dot indicates the maximum _a posteriori_ (most probable) difference, and the thick and thin lines indicate the 85% and 95% highest density intervals, respectively.
+
+
+```{r pairwise_contrasts}
+pairwise <- model_2 %>%
+  recover_types(flow) %>%
+  spread_draws(b[Protein]) %>%
+  compare_levels(b, by = Protein)
+
+pairwise_summary <- median_hdi(pairwise)
+
+pairwise %>%
+  ungroup() %>%
+  mutate(Protein = reorder(Protein, b)) %>%
+  ggplot(aes(y = Protein, x = b)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  stat_halfeye(.width = c(0.95, 0.85), fill = "skyblue", point_interval = median_hdi) + 
+  scale_fill_manual(values = "skyblue") +
+  labs(y = "", x = "Difference in fitted value") +
+  theme_bw() +
+  theme()
+``` 
+
+The same data is represented below in tabular form. The only pairwise difference to have a zero difference within its 95% highest density interval was MUTANT+BLV - MUTANT, suggesting no evidence of a systematic difference in reactivity between these conditions. 
+
+```{r table_pairwise}
+knitr::kable(
+  model_2 %>%
+    recover_types(flow) %>%
+    spread_draws(b[Protein]) %>%
+    compare_levels(b, by = Protein) %>%
+    median_hdi()
+)
+```
+
+## Chain diagnostics
+
+Below is some diagnostic information about the Hamiltonian Monte Carlo search used to find the posterior.
+
+```{r parameter_diagnostics}
+precis(model_2, depth = 2)
+```
+
+```{r traceplot}
+traceplot(model_2, window = c(5000, 10000))
+```
+
+## Figure for paper
+
+```{r paper_figure}
+plot_a <- flow %>%
+  pivot_wider(names_from = Protein, values_from = MFI, id_cols = Sample) %>%
+  pivot_longer(names_to = "WT",
+               values_to = "OD-BLV",
+               cols = c(`WT`, `MUTANT`)) %>%
+  pivot_longer(names_to = "N121Q",
+               values_to = "OD+BLV",
+               cols = c(`WT+BLV`, `MUTANT+BLV`)) %>%
+  filter((WT == "WT" & N121Q == "WT+BLV") |
+           (WT == "MUTANT" & N121Q == "MUTANT+BLV")) %>%
+  ggplot(aes(`OD-BLV`, `OD+BLV`, col = WT)) +
+  geom_point() +
+  labs(x = "OD, -biliverdin", y = "OD, +biliverdin") +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(intercept = 0, slope = 1, col = "grey") +
+  annotate(geom = "text", label = "N121Q", x = 5000, y = 5800, size = 5, col = "#377EB8") +
+  annotate(geom = "text", label = "WT", x = 6500, y = 4000, size = 5, col = "#E41A1C") +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = -1) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+plot_b <- model_2 %>%
+  recover_types(flow) %>%
+  spread_draws(b[Protein]) %>%
+  compare_levels(b, by = Protein) %>%
+  ungroup() %>%
+  filter(Protein == "WT+BLV - WT" | Protein == "MUTANT+BLV - MUTANT") %>%
+  ggplot(aes(y = 1, x = b, fill = Protein)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  stat_halfeye(.width = c(0.85, 0.95), point_interval = "median_hdi") + 
+  annotate(geom = "text", label = "WT", x = -950, y = 2.2, size = 3) +
+  annotate(geom = "text", label = "N121Q", x = -10, y = 2.2, size = 3) +
+  scale_fill_manual(values = c("#377EB8", "#E41A1C")) +
+  scale_y_discrete(labels = c("WT", "N121Q")) +
+  labs(y = "", x = "\u0394OD (+/- biliverdin)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.background = element_blank(),
+        panel.grid.major.y = element_blank())
+
+plot_a + inset_element(plot_b, left = -0.02, bottom = 0.6, right = 0.5, top = 0.99)
+```
+
